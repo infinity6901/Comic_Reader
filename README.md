@@ -162,10 +162,13 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
 ### Release signing
 
-`app/build.gradle.kts` reads `keystore.properties` from the project root and, if
-present, signs the release build with `keystore/release.jks`. Both files are
-listed in `.gitignore` and **must not be committed**. If `keystore.properties` is
-absent the release build still compiles, just unsigned.
+The release variant uses Gradle's standard `debug` signing configuration so the
+APK can be installed directly without a private keystore or GitHub Actions
+secrets. GitHub-hosted runners are ephemeral and may generate different debug
+keys between runs. Consequently, a release APK from a later CI run may not update
+an installation from an earlier run; uninstalling first may erase local app data.
+For durable public distribution and seamless upgrades, use a stable private
+release key and protect it securely.
 
 Release uses `isMinifyEnabled = true` + `isShrinkResources = true` (R8). The
 proguard rules keep junrar and commons-compress whole so the reflection paths in
@@ -188,8 +191,8 @@ the archive backends survive minification.
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-Note: the debug and release APKs use different signing keys, so installing one
-requires uninstalling the other.
+Note: the debug and release APKs use the same debug signing configuration in this
+project. APKs produced by different CI runs may still have different signing keys.
 
 ## Permissions
 

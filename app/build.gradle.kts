@@ -1,19 +1,10 @@
-import java.io.FileInputStream
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
-// Release signing, loaded from keystore.properties (not committed). If the file
-// is absent the release build still compiles, just unsigned -- handy on CI.
-val keystorePropsFile = rootProject.file("keystore.properties")
-val keystoreProps = Properties().apply {
-    if (keystorePropsFile.exists()) {
-        FileInputStream(keystorePropsFile).use { load(it) }
-    }
-}
+// FOSS/direct-distribution build: use Gradle’s standard debug signing key for the
+// release variant. No private keystore or GitHub signing secrets are required.
 
 android {
     namespace = "com.infinity.comicreader"
@@ -28,28 +19,18 @@ android {
         vectorDrawables { useSupportLibrary = true }
     }
 
-    signingConfigs {
-        if (keystorePropsFile.exists()) {
-            create("release") {
-                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
-                storePassword = keystoreProps.getProperty("storePassword")
-                keyAlias = keystoreProps.getProperty("keyAlias")
-                keyPassword = keystoreProps.getProperty("keyPassword")
-            }
-        }
-    }
 
     buildTypes {
         release {
+            // Signed for direct installation without a private release keystore.
+            // For durable app upgrades across different machines, use a stable private key.
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            if (keystorePropsFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
-            }
         }
     }
 
