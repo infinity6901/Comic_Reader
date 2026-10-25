@@ -18,6 +18,7 @@ jobs:
   build:
     name: Test and build APKs
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -31,39 +32,82 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Create CI-only Android debug signing key
+      - name: Configure Android signing
         shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          keytool -genkeypair -v \
-            -keystore "$GITHUB_WORKSPACE/debug.keystore" \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-          cat > "$GITHUB_WORKSPACE/keystore.properties" <<'PROPS'
+
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && -n "$ANDROID_KEYSTORE_PASSWORD" && -n "$ANDROID_KEY_ALIAS" && -n "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "Using the persistent private Android release key."
+
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" \
+              | base64 --decode > "$GITHUB_WORKSPACE/release.keystore"
+
+            cat > "$GITHUB_WORKSPACE/keystore.properties" <<PROPS
+          storeFile=release.keystore
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          PROPS
+
+            echo "SIGNING_MODE=private" >> "$GITHUB_ENV"
+          else
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::Version-tagged releases require all four repository secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD."
+              exit 1
+            fi
+
+            echo "::warning::Signing secrets are missing. This build will use a temporary debug key."
+
+            keytool -genkeypair -v \
+              -keystore "$GITHUB_WORKSPACE/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+
+            cat > "$GITHUB_WORKSPACE/keystore.properties" <<'PROPS'
           storeFile=debug.keystore
           storePassword=android
           keyAlias=androiddebugkey
           keyPassword=android
           PROPS
 
+            echo "SIGNING_MODE=debug" >> "$GITHUB_ENV"
+          fi
+
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      - name: Run unit tests, lint, and build debug/release APKs
+      - name: Run unit tests, lint, and build APKs
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleRelease
 
       - name: Prepare named APKs
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/ComicReader-debug.apk
-          cp app/build/outputs/apk/release/app-release.apk dist/ComicReader-release-debug-key.apk
+
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            dist/ComicReader-debug.apk
+
+          if [[ "$SIGNING_MODE" == "private" ]]; then
+            cp app/build/outputs/apk/release/app-release.apk \
+              dist/ComicReader-release.apk
+          else
+            cp app/build/outputs/apk/release/app-release.apk \
+              dist/ComicReader-release-debug-key.apk
+          fi
+
           sha256sum dist/*.apk > dist/SHA256SUMS.txt
 
       - name: Upload APK artifacts
@@ -79,8 +123,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
       - name: Download built APKs
         uses: actions/download-artifact@v4
@@ -95,13 +141,13 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/ComicReader-debug.apk
-            dist/ComicReader-release-debug-key.apk
+            dist/ComicReader-release.apk
             dist/SHA256SUMS.txt
           body: |
             ## Build artifacts
 
-            - `ComicReader-debug.apk`: debuggable development build.
-            - `ComicReader-release-debug-key.apk`: optimized release build signed with a generated Android **debug key** for testing only.
+            - `ComicReader-debug.apk`: Debuggable development build.
+            - `ComicReader-release.apk`: Optimized release build signed with the persistent private Android release key.
             - `SHA256SUMS.txt`: SHA-256 checksums for the APKs.
 
-            **Security warning:** the Android debug key uses publicly known credentials and is generated afresh by CI. This APK is not suitable for production distribution, Play Store upload, or upgrades signed with a private production key. Generate and protect a private release keystore for production releases.
+            **Important:** Keep your release keystore and passwords backed up securely. Future updates must use the same signing key to update existing installations. The debug APK is intended for development and testing.
