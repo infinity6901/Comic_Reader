@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!--
+        allowBackup is off: the app is fully offline and its data (reading history,
+        bookmarks, preferences) is device-local, so there is nothing worth syncing to
+        cloud backup and nothing sensitive to leak through one.
+        usesCleartextTraffic is declared explicitly (false) because the reader makes no
+        network requests at all; without the explicit value Android implicitly enables
+        cleartext for apps targeting older platform versions.
+    -->
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:requestLegacyExternalStorage="true"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ComicReader"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".ui.ListActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/x-cbz" />
+                <data android:mimeType="application/x-cbr" />
+                <data android:mimeType="application/x-cb7" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/pdf" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.ViewerActivity"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.ComicReader.Viewer"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode" />
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:label="@string/settings" />
+
+        <activity
+            android:name=".ui.AboutActivity"
+            android:label="@string/about" />
+
+        <activity
+            android:name=".ui.CropActivity"
+            android:label="@string/crop_title"
+            android:theme="@style/Theme.ComicReader.Viewer"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode" />
+
+        <activity
+            android:name=".ui.CleanupActivity"
+            android:label="@string/menu_dupes" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <activity
+            android:name=".ui.PagesActivity"
+            android:label="@string/pages_title" />
+    </application>
+
+</manifest>

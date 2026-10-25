@@ -1,0 +1,2036 @@
+package com.infinity.comicreader.ui
+
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.MediaStore
+import android.view.KeyEvent
+import android.view.Menu
+import android.view.MenuItem
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.LinearLayout
+import android.widget.SeekBar
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
+import androidx.core.content.FileProvider
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import androidx.viewpager2.widget.ViewPager2
+import com.google.android.material.bottomsheet.BottomSheetBehavior
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.chip.ChipGroup
+import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.slider.Slider
+import com.infinity.comicreader.util.ChopDetector
+import com.infinity.comicreader.R
+import com.infinity.comicreader.data.Bookmark
+import com.infinity.comicreader.data.HistoryItem
+import com.infinity.comicreader.data.Library
+import com.infinity.comicreader.data.Prefs
+import com.infinity.comicreader.data.SeriesSettings
+import com.infinity.comicreader.reader.Filters
+import com.infinity.comicreader.reader.PageSource
+import com.infinity.comicreader.reader.PageSources
+import com.infinity.comicreader.util.AppDispatchers
+import com.infinity.comicreader.util.SpreadLayout
+import com.infinity.comicreader.util.Formats
+import com.infinity.comicreader.util.NaturalOrder
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.BitSet
+import kotlin.math.abs
+
+/**
+ * The reader.
+ *
+ * Page layout is one of three modes — paged, vertical or long strip — and every
+ * reader option (mode, fit, filter, brightness, spacing, direction, two-page,
+ * night filter, keep-on, fullscreen) is read from and written back to [Prefs], so
+ * the choices survive chapter changes and app restarts.
+ */
+class ViewerActivity : AppCompatActivity() {
+
+    private lateinit var prefs: Prefs
+    private lateinit var library: Library
+
+    private lateinit var pager: ViewPager2
+    private lateinit var vertical: RecyclerView
+    private lateinit var toolbar: Toolbar
+    private lateinit var bottomBar: LinearLayout
+    private lateinit var seek: SeekBar
+    private lateinit var pageText: TextView
+    private lateinit var chapterText: TextView
+    private lateinit var dim: View
+    private lateinit var nightOverlay: View
+    private lateinit var progress: android.widget.ProgressBar
+    private lateinit var endCard: View
+    private lateinit var endSubtitle: TextView
+    private lateinit var endNext: View
+    private lateinit var endPrev: View
+    private lateinit var btnPrevChapter: ImageButton
+    private lateinit var btnNextChapter: ImageButton
+
+    private var source: PageSource? = null
+    private var adapter: PageAdapter? = null
+    private var file: File? = null
+
+    /**
+     * The next chapter, opened ahead so a vertical or long-strip reader rolls
+     * straight into it instead of stopping at the chapter's end. While it is
+     * pending it is simply appended to the strip ([stripAheadFile] tracks the
+     * chapter it belongs to, since [file] still points at the one being read).
+     */
+    private var stripAhead: PageSource? = null
+    private var stripAheadFile: File? = null
+    private var stripAheadJob: Job? = null
+
+    /** True between spotting a chapter boundary and running the posted roll-on. */
+    private var stripRollPending = false
+
+    /** Sibling chapters (openable files in the same folder), natural-ordered. */
+    private var chapters: List<File> = emptyList()
+
+    /** Current page index (always a real page, never a spread index). */
+    private var currentIndex = 0
+    private var mode = MODE_PAGED
+    private var twoPage = false
+    private var readingDir = "ltr"
+    private var filter = Filters.NONE
+    private var brightness = 100
+    private var spacingDp = 0
+    private var nightFilter = false
+    private var keepOn = false
+    private var barsVisible = true
+    private var fit = "screen"
+    private var autoCrop = false
+
+    /** True when this folder has its own remembered layout (mode, direction, fit, spread). */
+    private var seriesActive = false
+
+    private var openJob: Job? = null
+    private var endDismissed = false
+    private var markedRead = false
+
+    // auto-scroll
+    private val handler = Handler(Looper.getMainLooper())
+    private var autoScrolling = false
+    private var autoRemainder = 0f
+    private var autoLastFrame = 0L
+
+    /** Set when a chapter change should carry the running auto-scroll over. */
+    private var keepAutoScroll = false
+
+    // reading statistics for the current session
+    private var sessionStart = 0L
+    private val seenPages = BitSet()
+
+    private var cropSource: File? = null
+
+    private val cropLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                result.data?.getStringExtra(CropActivity.EXTRA_RESULT)?.let {
+                    toast(getString(R.string.crop_saved, it))
+                }
+            }
+            deleteCropSource()
+        }
+
+    private val pagesLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                val page = result.data?.getIntExtra(PagesActivity.EXTRA_RESULT_PAGE, -1) ?: -1
+                if (page >= 0) goTo(page)
+            }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        prefs = Prefs(this)
+        library = Library(this)
+        setContentView(R.layout.activity_viewer)
+        bindViews()
+        loadPrefs()
+
+        setSupportActionBar(toolbar)
+        toolbar.setNavigationOnClickListener { finish() }
+
+        // Page-change callbacks are registered once: they outlive adapter swaps.
+        pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+            override fun onPageScrollStateChanged(state: Int) {
+                if (state == ViewPager2.SCROLL_STATE_DRAGGING) stopAutoScroll()
+            }
+
+            override fun onPageSelected(position: Int) {
+                if (mode != MODE_PAGED) return
+                currentIndex = itemToPage(position)
+                seek.progress = position
+                onPageChanged()
+            }
+        })
+        vertical.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
+                // Touching the list takes over from auto-scroll.
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) stopAutoScroll()
+            }
+
+            override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+                if (mode == MODE_PAGED) return
+                val lm = rv.layoutManager as? LinearLayoutManager ?: return
+                // The page the reader counts as current: the first one fully on screen.
+                val pos = lm.findFirstCompletelyVisibleItemPosition().takeIf { it >= 0 }
+                    ?: lm.findFirstVisibleItemPosition()
+                // The chapter behind the reader was appended to this strip, so the
+                // pages on screen already belong to it: rolling over is bookkeeping.
+                // RecyclerView warns against trimming items from inside a scroll
+                // callback, so the roll is posted; until it runs the index is left
+                // alone rather than being read against a strip it no longer matches.
+                if (stripAhead != null && pos >= chapterPages()) {
+                    if (!stripRollPending) {
+                        stripRollPending = true
+                        rv.post {
+                            stripRollPending = false
+                            commitStripChapter()
+                        }
+                    }
+                    return
+                }
+                if (stripRollPending) return
+                if (pos >= 0 && itemToPage(pos) != currentIndex) {
+                    // Never count past this chapter: crossing into the next one is
+                    // the roll-on's job, not the indicator's.
+                    currentIndex = itemToPage(pos)
+                        .coerceIn(0, (chapterPages() - 1).coerceAtLeast(0))
+                    seek.progress = pos
+                    onPageChanged()
+                }
+                if (mode == MODE_LONGSTRIP) updateEndCard()
+            }
+        })
+
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, value: Int, fromUser: Boolean) {
+                if (fromUser) goTo(itemToPage(value))
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar) {
+                // Intentionally empty: the page is updated in onProgressChanged only.
+            }
+
+            override fun onStopTrackingTouch(sb: SeekBar) {
+                // Intentionally empty: the page is updated in onProgressChanged only.
+            }
+        })
+
+        // Neither paged nor strip mode can scroll past their last page, so a swipe in
+        // that direction is caught here: with auto next chapter on it rolls on.
+        (pager.getChildAt(0) as? RecyclerView)?.addOnItemTouchListener(overSwipeListener)
+        vertical.addOnItemTouchListener(overSwipeListener)
+
+        btnPrevChapter = findViewById(R.id.btn_prev_chapter)
+        btnNextChapter = findViewById(R.id.btn_next_chapter)
+        btnPrevChapter.setOnClickListener { openPrevChapter() }
+        btnNextChapter.setOnClickListener { openNextChapter() }
+        findViewById<View>(R.id.btn_prev_page).setOnClickListener { goTo(currentIndex - 1) }
+        findViewById<View>(R.id.btn_next_page).setOnClickListener { goTo(currentIndex + 1) }
+        findViewById<View>(R.id.btn_pages).setOnClickListener { openPages() }
+
+        endPrev.setOnClickListener { openPrevChapter() }
+        endNext.setOnClickListener { openNextChapter() }
+        findViewById<View>(R.id.end_close).setOnClickListener {
+            endDismissed = true
+            hideEndCard()
+        }
+
+        open()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        stopAutoScroll()
+        flushStats()
+        saveHistory()
+        openJob?.cancel()
+        closeSource()
+        endDismissed = false
+        hideEndCard()
+        open()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        sessionStart = SystemClock.elapsedRealtime()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateChopDetector()
+    }
+
+    override fun onPause() {
+        chopDetector?.stop()
+        super.onPause()
+    }
+
+    /** Listens for the chop-chop motion only while the reader is on screen and it is enabled. */
+    private fun updateChopDetector() {
+        if (!prefs.chopExit) {
+            chopDetector?.stop()
+            return
+        }
+        val detector = chopDetector ?: ChopDetector(this, { prefs.chopSensitivity }) { panicExit() }.also { chopDetector = it }
+        detector.start()
+    }
+
+    /**
+     * Quick exit: saves the place, then closes the whole task and drops it from the
+     * recent-apps list, so the phone lands on the home screen with nothing left behind.
+     */
+    private fun panicExit() {
+        if (isFinishing) return
+        stopAutoScroll()
+        saveHistory()
+        flushStats()
+        finishAndRemoveTask()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stopAutoScroll()
+        saveHistory()
+        flushStats()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        sheetSync = null
+        chopDetector?.stop()
+        chopDetector = null
+        stopAutoScroll()
+        openJob?.cancel()
+        closeSource()
+        deleteCropSource()
+    }
+
+    /** Adds this session's reading time and newly seen pages to the statistics. */
+    private fun flushStats() {
+        if (sessionStart == 0L) return
+        val seconds = ((SystemClock.elapsedRealtime() - sessionStart) / 1000L)
+            .coerceIn(0L, MAX_SESSION_SECONDS)
+        val pages = seenPages.cardinality()
+        sessionStart = SystemClock.elapsedRealtime()
+        seenPages.clear()
+        if (source != null) library.addReading(seconds, pages)
+    }
+
+    private fun deleteCropSource() {
+        cropSource?.let { runCatching { it.delete() } }
+        cropSource = null
+    }
+
+    private fun bindViews() {
+        pager = findViewById(R.id.viewer_pager)
+        vertical = findViewById(R.id.viewer_vertical)
+        toolbar = findViewById(R.id.viewer_toolbar)
+        bottomBar = findViewById(R.id.viewer_bottom)
+        seek = findViewById(R.id.viewer_seek)
+        pageText = findViewById(R.id.viewer_page_text)
+        chapterText = findViewById(R.id.viewer_chapter_text)
+        dim = findViewById(R.id.viewer_dim)
+        nightOverlay = findViewById(R.id.night_overlay)
+        progress = findViewById(R.id.viewer_progress)
+        endCard = findViewById(R.id.viewer_end)
+        endSubtitle = findViewById(R.id.end_subtitle)
+        endNext = findViewById(R.id.end_next)
+        endPrev = findViewById(R.id.end_prev)
+        vertical.layoutManager = LinearLayoutManager(this)
+    }
+
+    private fun loadPrefs() {
+        mode = prefs.pageMode
+        twoPage = prefs.twoPage
+        readingDir = prefs.readingDir
+        fit = prefs.fit
+        autoCrop = prefs.autoCrop
+        filter = prefs.filter
+        brightness = prefs.brightness
+        spacingDp = prefs.pageSpacing
+        keepOn = prefs.keepScreenOn
+        nightFilter = prefs.nightFilter
+        applyKeepScreenOn()
+        applyNight()
+        applyBrightness()
+        if (prefs.fullscreen) setFullscreen(true)
+    }
+
+    /** Applies the folder's remembered layout, if it has one and the feature is on. */
+    private fun applySeries(folder: String) {
+        val saved = if (prefs.perSeries) library.seriesFor(folder) else null
+        seriesActive = saved != null
+        if (saved == null) return
+        mode = saved.mode.takeIf { it == MODE_PAGED || it == MODE_VERTICAL || it == MODE_LONGSTRIP } ?: MODE_PAGED
+        readingDir = if (saved.dir == "rtl") "rtl" else "ltr"
+        fit = saved.fit
+        twoPage = saved.twoPage
+    }
+
+    /**
+     * Stores the layout options: with the folder's own settings when it remembers them,
+     * otherwise as the global defaults.
+     */
+    private fun persistLayout() {
+        val folder = file?.parentFile?.absolutePath
+        if (seriesActive && folder != null) {
+            library.setSeries(folder, SeriesSettings(mode, readingDir, fit, twoPage))
+        } else {
+            prefs.pageMode = mode
+            prefs.readingDir = readingDir
+            prefs.fit = fit
+            prefs.twoPage = twoPage
+        }
+    }
+
+    private fun toggleSeries() {
+        val folder = file?.parentFile?.absolutePath ?: return
+        seriesActive = !seriesActive
+        if (seriesActive) {
+            library.setSeries(folder, SeriesSettings(mode, readingDir, fit, twoPage))
+            toast(R.string.series_saved)
+        } else {
+            library.setSeries(folder, null)
+            toast(R.string.series_cleared)
+        }
+        invalidateOptionsMenu()
+    }
+
+    // ------------------------------------------------------------------ loading
+
+    private fun open() {
+        val path = intent.getStringExtra(EXTRA_PATH)
+        if (path == null) {
+            finish()
+            return
+        }
+        val target = File(path)
+        file = target
+        toolbar.title = chapterLabel(target)
+        progress.visibility = View.VISIBLE
+        markedRead = false
+        mode = prefs.pageMode
+        readingDir = prefs.readingDir
+        fit = prefs.fit
+        twoPage = prefs.twoPage
+        target.parentFile?.absolutePath?.let { applySeries(it) }
+
+        openJob = lifecycleScope.launch {
+            val (src, siblings) = withContext(AppDispatchers.io) {
+                val s = runCatching { PageSources.open(target, prefs.charset) }.getOrNull()
+                try {
+                    ensureActive()
+                } catch (e: CancellationException) {
+                    // A newer open() replaced this one: do not leak the file handle.
+                    runCatching { s?.close() }
+                    throw e
+                }
+                s to siblingChapters(target)
+            }
+            progress.visibility = View.GONE
+            chapters = siblings
+            if (src == null) {
+                toast(R.string.error_open)
+                finish()
+                return@launch
+            }
+            if (src.pageCount <= 0) {
+                runCatching { src.close() }
+                toast(R.string.error_open)
+                finish()
+                return@launch
+            }
+            source = src
+            setup(src)
+        }
+    }
+
+    private fun closeSource() {
+        adapter?.release()
+        adapter = null
+        stripAheadJob?.cancel()
+        stripAheadJob = null
+        runCatching { stripAhead?.close() }
+        stripAhead = null
+        stripAheadFile = null
+        runCatching { source?.close() }
+        source = null
+        pager.adapter = null
+        vertical.adapter = null
+    }
+
+    private fun siblingChapters(f: File): List<File> {
+        val dir = f.parentFile ?: return listOf(f)
+        val files = dir.listFiles() ?: return listOf(f)
+        val openable = files
+            .filter { it.isFile && !it.name.startsWith(".") && Formats.isOpenable(it.name) }
+            .sortedWith(compareBy(NaturalOrder) { it.name })
+        return if (openable.any { it.absolutePath == f.absolutePath }) openable else openable + f
+    }
+
+    private fun setup(src: PageSource) {
+        val requested = intent.getIntExtra(EXTRA_PAGE, -1)
+        val saved = library.pageFor(file!!.absolutePath)
+        val start = when {
+            requested >= 0 -> requested
+            prefs.resume -> saved
+            else -> 0
+        }
+        currentIndex = start.coerceIn(0, src.pageCount - 1)
+        seenPages.clear()
+        attach()
+        prepareStripAhead()
+
+        // Carrying an auto-scroll run into the next chapter must survive the reload.
+        if (keepAutoScroll) {
+            keepAutoScroll = false
+            startAutoScroll()
+        }
+
+        if (requested < 0 && prefs.resume && prefs.askResume && saved in 1 until src.pageCount &&
+            !isFinishing && !isDestroyed
+        ) {
+            askStartPage(saved, src.pageCount)
+        }
+    }
+
+    /** The resume / first-page choice offered when a chapter has saved progress. */
+    private fun askStartPage(saved: Int, count: Int) {
+        val percent = ((saved + 1) * 100f / count).toInt().coerceIn(1, 100)
+        AlertDialog.Builder(this)
+            .setTitle(chapterLabel(file!!))
+            .setMessage(getString(R.string.resume_progress, saved + 1, count, percent))
+            .setPositiveButton(R.string.resume_page) { _, _ -> goTo(saved) }
+            .setNegativeButton(R.string.first_page) { _, _ -> goTo(0) }
+            .show()
+    }
+
+    /**
+     * Builds a fresh adapter for the current layout. A [RecyclerView.Adapter] has
+     * a fixed item view type, so changing the mode, spread or reading direction
+     * requires a new instance. These are only emitted from the UI thread.
+     */
+    private fun attach() {
+        val src = source ?: return
+        pager.adapter = null
+        vertical.adapter = null
+        adapter?.release()
+
+        val a = PageAdapter(
+            source = src,
+            mode = adapterMode(),
+            onTap = { fraction -> onTap(fraction) },
+            doubleTapZoom = prefs.doubleTapZoom,
+            twoPage = useSpread(),
+            rtl = readingDir == "rtl",
+            onVerticalDrag = if (brightnessGestureEnabled()) ({ dy -> onBrightnessDrag(dy) }) else null,
+            autoCrop = autoCrop,
+            preload = prefs.preload
+        )
+        a.fitMode = effectiveFit()
+        a.filter = filter
+        a.spacingPx = spacingPx()
+        adapter = a
+
+        val item = pageToItem(currentIndex)
+        // The roll-on chapter travels with the reader: adapters are rebuilt for
+        // every layout change, so the already-opened source is laid in again.
+        if (mode != MODE_PAGED) stripAhead?.let { a.append(it) }
+        if (mode == MODE_PAGED) {
+            pager.layoutDirection =
+                if (readingDir == "rtl") View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
+            vertical.visibility = View.GONE
+            pager.visibility = View.VISIBLE
+            pager.adapter = a
+            pager.setCurrentItem(item, false)
+        } else {
+            pager.visibility = View.GONE
+            vertical.visibility = View.VISIBLE
+            vertical.adapter = a
+            vertical.scrollToPosition(item)
+        }
+        // The slider stays scoped to this chapter even while the strip holds more:
+        // seeking past its end would roll on, which the slider should not do by itself.
+        seek.max = pageToItem((src.pageCount - 1).coerceAtLeast(0))
+        seek.progress = item
+        onPageChanged()
+    }
+
+    // ------------------------------------------------------- seamless chapter roll
+
+    /** Pages in the chapter being read (the strip may already hold the next one too). */
+    private fun chapterPages() = source?.pageCount ?: 0
+
+    /**
+     * Opens the chapter after this one so vertical and long-strip reading can be
+     * rolled straight into it. Nothing is on screen yet: once its pages are open
+     * they are laid in behind the current chapter's, and scrolling simply reaches
+     * them, exactly like scrolling between two pages of one archive.
+     */
+    private fun prepareStripAhead() {
+        stripAheadJob?.cancel()
+        stripAheadJob = null
+        if (mode == MODE_PAGED || !prefs.autoNext) return
+        if (stripAhead != null) return
+        val next = nextChapter() ?: return
+        stripAheadJob = lifecycleScope.launch {
+            // [opened] is written from inside the IO block, so the handle is still known
+            // here even when the coroutine is cancelled just as the block finishes (the
+            // block's return value would be lost then). Whatever is not adopted below is
+            // closed in the finally clause, on every exit path.
+            var opened: PageSource? = null
+            var adopted = false
+            try {
+                withContext(AppDispatchers.io) {
+                    opened = runCatching { PageSources.open(next, prefs.charset) }.getOrNull()
+                }
+                val src = opened
+                // Unreadable: the reader just falls back to stopping at the end.
+                if (src == null || src.pageCount <= 0) return@launch
+                ensureActive()
+                stripAhead = src
+                stripAheadFile = next
+                adopted = true
+                // The mode or the setting may have changed while the archive was opening.
+                if (mode != MODE_PAGED && prefs.autoNext) adapter?.append(src)
+            } finally {
+                if (!adopted) runCatching { opened?.close() }
+            }
+        }
+    }
+
+    /**
+     * Switches the reader over to the chapter that was appended to the strip. The
+     * strip already shows its pages, so nothing is reloaded or re-decoded: the file,
+     * source and page index simply move on, the pages already scrolled past are
+     * trimmed away, and the chapter after that is opened for the next roll-on.
+     */
+    private fun commitStripChapter() {
+        val a = adapter ?: return
+        val finished = source ?: return
+        val next = stripAhead ?: return
+        val nextFile = stripAheadFile ?: return
+        val boundary = finished.pageCount
+
+        // The chapter just read is done: record it before moving on.
+        currentIndex = (boundary - 1).coerceAtLeast(0)
+        onPageChanged()
+        saveHistory()
+        flushStats()
+
+        // Re-anchor on the boundary item at its current offset: it is the first page
+        // of the new chapter that survives the trim, and its (usually negative) top
+        // keeps the viewport exactly where it was.
+        val lm = vertical.layoutManager as? LinearLayoutManager
+        val first = lm?.findFirstVisibleItemPosition() ?: 0
+        val anchor = first.coerceAtLeast(boundary)
+        val top = lm?.findViewByPosition(anchor)?.top ?: 0
+
+        source = next
+        file = nextFile
+        currentIndex = (first - boundary).coerceAtLeast(0)
+        stripAhead = null
+        stripAheadFile = null
+        seenPages.clear()
+        markedRead = false
+        toolbar.title = chapterLabel(nextFile)
+
+        a.dropItemsBefore(boundary)
+        lm?.scrollToPositionWithOffset((anchor - boundary).coerceAtLeast(0), top)
+
+        seek.max = pageToItem((next.pageCount - 1).coerceAtLeast(0))
+        seek.progress = pageToItem(currentIndex)
+        onPageChanged()
+        prepareStripAhead()
+    }
+
+    /**
+     * Undoes the roll-on: closes the chapter opened ahead and trims it back out of
+     * the strip, so turning "auto next chapter" off mid-chapter still ends it with
+     * the usual prompt.
+     */
+    private fun dropStripAhead() {
+        stripAheadJob?.cancel()
+        stripAheadJob = null
+        val ahead = stripAhead ?: return
+        stripAhead = null
+        stripAheadFile = null
+        // The adapter owns its segments: trimming the chapter out of the strip
+        // lets it close the source once nothing is decoding from it anymore.
+        val a = adapter
+        if (a != null) a.dropAppended() else runCatching { ahead.close() }
+        // Restores the end card, which the pending chapter may have suppressed.
+        updateEndCard()
+    }
+
+    private fun adapterMode(): PageAdapter.Mode = when (mode) {
+        MODE_VERTICAL -> PageAdapter.Mode.VERTICAL
+        MODE_LONGSTRIP -> PageAdapter.Mode.LONG_STRIP
+        else -> PageAdapter.Mode.PAGED
+    }
+
+    private fun useSpread() = twoPage && mode == MODE_PAGED
+
+    private fun pageToItem(page: Int) = if (useSpread()) SpreadLayout.itemForPage(page) else page
+
+    private fun itemToPage(item: Int) = if (useSpread()) SpreadLayout.firstPageForProgress(item) else item
+
+    private fun brightnessGestureEnabled() = prefs.brightnessGesture && mode == MODE_PAGED
+
+    private fun spacingPx(): Int =
+        (spacingDp * resources.displayMetrics.density).toInt()
+
+    private fun effectiveFit(): ZoomImageView.FitMode {
+        // "Fit screen" is meaningless for a continuous column, so treat it as
+        // fit-to-width there.
+        val name = if (mode != MODE_PAGED && fit == "screen") "width" else fit
+        return when (name) {
+            "width" -> ZoomImageView.FitMode.WIDTH
+            "height" -> ZoomImageView.FitMode.HEIGHT
+            "stretch" -> ZoomImageView.FitMode.STRETCH
+            else -> ZoomImageView.FitMode.SCREEN
+        }
+    }
+
+    // ------------------------------------------------------------------ paging
+
+    private fun goTo(page: Int) {
+        val count = source?.pageCount ?: return
+        if (page < 0) {
+            if (prefs.autoNext) openPrevChapter() else goTo(0)
+            return
+        }
+        if (page >= count) {
+            handleAdvance()
+            return
+        }
+        currentIndex = page
+        val item = pageToItem(currentIndex)
+        if (mode == MODE_PAGED) pager.setCurrentItem(item, false) else vertical.scrollToPosition(item)
+        seek.progress = item
+        onPageChanged()
+    }
+
+    /** Called when the reader is told to move past the last page. */
+    private fun handleAdvance() {
+        val next = nextChapter()
+        if (next == null) {
+            toast(R.string.finished_last_chapter)
+            return
+        }
+        if (!prefs.autoNext) {
+            showEndCard()
+            return
+        }
+        // A strip that already holds the next chapter needs no reload: rolling on
+        // is pure bookkeeping, and the pages on screen keep rendering.
+        if (mode != MODE_PAGED && stripAhead != null) {
+            commitStripChapter()
+            vertical.scrollToPosition(0)
+        } else {
+            openChapter(next, 0)
+        }
+    }
+
+    private fun onTap(fraction: Float) {
+        if (!prefs.tapZones || mode == MODE_LONGSTRIP) {
+            toggleBars()
+            return
+        }
+        val rtl = readingDir == "rtl" && mode == MODE_PAGED
+        val delta = when {
+            fraction < 0.33f -> if (rtl) 1 else -1
+            fraction > 0.67f -> if (rtl) -1 else 1
+            else -> {
+                toggleBars()
+                return
+            }
+        }
+        goTo(currentIndex + delta)
+    }
+
+    private fun onPageChanged() {
+        val count = source?.pageCount ?: 0
+        pageText.text = getString(R.string.page_indicator, currentIndex + 1, count)
+        chapterText.text = modeLabel()
+        updateChapterButtons()
+        updateEndCard()
+        if (currentIndex in 0 until count) seenPages.set(currentIndex)
+        val lastPageOfCurrentItem = if (useSpread()) (count - 2).coerceAtLeast(0) else count - 1
+        if (!markedRead && count > 0 && currentIndex >= lastPageOfCurrentItem) {
+            markedRead = true
+            file?.absolutePath?.let { library.setRead(it, true) }
+        }
+        invalidateOptionsMenu()
+    }
+
+    private fun modeLabel(): String = when (mode) {
+        MODE_VERTICAL -> getString(R.string.page_mode_vertical)
+        MODE_LONGSTRIP -> getString(R.string.page_mode_longstrip)
+        else -> getString(R.string.page_mode_paged)
+    }
+
+    private fun updateEndCard() {
+        val src = source ?: return
+        // "Auto next chapter" replaces the prompt entirely: the reader simply
+        // rolls into the next chapter when the user moves past the last page.
+        if (autoAdvance()) {
+            hideEndCard()
+            return
+        }
+        val atEnd = when (mode) {
+            MODE_LONGSTRIP -> !vertical.canScrollVertically(1)
+            else -> currentIndex >= src.pageCount - 1
+        }
+        if (!atEnd) {
+            endDismissed = false
+            hideEndCard()
+        } else if (!endDismissed) {
+            showEndCard()
+        }
+    }
+
+    private fun showEndCard() {
+        val f = file ?: return
+        if (autoAdvance()) return
+        endCard.visibility = View.VISIBLE
+        endSubtitle.text = getString(R.string.chapter_end_msg, chapterLabel(f))
+        endNext.visibility = if (nextChapter() != null) View.VISIBLE else View.GONE
+        endPrev.visibility = if (prevChapter() != null) View.VISIBLE else View.GONE
+    }
+
+    private fun hideEndCard() {
+        endCard.visibility = View.GONE
+    }
+
+    private fun updateChapterButtons() {
+        val hasNext = nextChapter() != null
+        val hasPrev = prevChapter() != null
+        btnNextChapter.isEnabled = hasNext
+        btnNextChapter.alpha = if (hasNext) 1f else 0.3f
+        btnPrevChapter.isEnabled = hasPrev
+        btnPrevChapter.alpha = if (hasPrev) 1f else 0.3f
+    }
+
+    private fun saveHistory() {
+        val f = file ?: return
+        val count = source?.pageCount ?: return
+        library.addHistory(
+            HistoryItem(f.absolutePath, f.name, currentIndex, count, System.currentTimeMillis())
+        )
+    }
+
+    // ------------------------------------------------------------------ chapters
+
+    private fun siblingIndex(): Int = chapters.indexOfFirst { it.absolutePath == file?.absolutePath }
+
+    private fun nextChapter(): File? {
+        val i = siblingIndex()
+        return if (i >= 0 && i + 1 < chapters.size) chapters[i + 1] else null
+    }
+
+    private fun prevChapter(): File? {
+        val i = siblingIndex()
+        return if (i > 0) chapters[i - 1] else null
+    }
+
+    private fun openNextChapter() {
+        val next = nextChapter()
+        if (next == null) {
+            toast(R.string.no_next_chapter)
+            return
+        }
+        openChapter(next, 0)
+    }
+
+    private fun openPrevChapter() {
+        val prev = prevChapter()
+        if (prev == null) {
+            toast(R.string.no_prev_chapter)
+            return
+        }
+        openChapter(prev, 0)
+    }
+
+    private fun openChapter(target: File, page: Int) {
+        saveHistory()
+        val intent = Intent(this, ViewerActivity::class.java)
+            .putExtra(EXTRA_PATH, target.absolutePath)
+            .putExtra(EXTRA_PAGE, page)
+        // singleTop + onNewIntent: the reader reloads in place, so the back stack
+        // never grows one activity per chapter.
+        startActivity(intent)
+    }
+
+    private fun chapterLabel(f: File): String {
+        val name = f.name
+        val dot = name.lastIndexOf('.')
+        return if (dot > 0) name.substring(0, dot) else name
+    }
+
+    // ------------------------------------------------------------------ gestures
+
+    private fun onBrightnessDrag(dy: Float) {
+        val range = 420f * resources.displayMetrics.density
+        val delta = (dy / range) * 85f
+        setBrightness((brightness + delta).toInt().coerceIn(20, 100))
+    }
+
+    private fun setBrightness(value: Int) {
+        brightness = value.coerceIn(20, 100)
+        prefs.brightness = brightness
+        applyBrightness()
+    }
+
+    private fun applyBrightness() {
+        dim.alpha = ((100 - brightness) / 100f) * 0.82f
+    }
+
+    private fun applyNight() {
+        nightOverlay.visibility = if (nightFilter) View.VISIBLE else View.GONE
+    }
+
+    private fun setNight(enabled: Boolean) {
+        if (nightFilter == enabled) return
+        nightFilter = enabled
+        prefs.nightFilter = enabled
+        applyNight()
+        invalidateOptionsMenu()
+    }
+
+    private fun toggleNight() = setNight(!nightFilter)
+
+    private fun applyKeepScreenOn() {
+        if (keepOn) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun setKeepOn(enabled: Boolean) {
+        if (keepOn == enabled) return
+        keepOn = enabled
+        prefs.keepScreenOn = enabled
+        applyKeepScreenOn()
+        invalidateOptionsMenu()
+    }
+
+    private fun toggleKeepOn() = setKeepOn(!keepOn)
+
+    private fun setFullscreen(enabled: Boolean) {
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        if (enabled) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+        prefs.fullscreen = enabled
+        invalidateOptionsMenu()
+    }
+
+    private fun toggleBars() {
+        barsVisible = !barsVisible
+        animateBar(toolbar, barsVisible)
+        animateBar(bottomBar, barsVisible)
+    }
+
+    private fun animateBar(view: View, visible: Boolean) {
+        view.animate().cancel()
+        if (visible) {
+            view.visibility = View.VISIBLE
+            view.animate().alpha(1f).setDuration(150).start()
+        } else {
+            view.animate().alpha(0f).setDuration(150).withEndAction {
+                view.visibility = View.GONE
+            }.start()
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (prefs.volumeKeys && isVolumeKey(keyCode)) {
+            // Auto-repeat would skip pages while the key is held; one press, one page.
+            if (event.repeatCount == 0) {
+                stopAutoScroll()
+                goTo(currentIndex + if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) 1 else -1)
+            }
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    /** Swallow the key-up too, otherwise the system still shows its volume UI. */
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (prefs.volumeKeys && isVolumeKey(keyCode)) return true
+        return super.onKeyUp(keyCode, event)
+    }
+
+    private fun isVolumeKey(keyCode: Int) =
+        keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+
+    // ------------------------------------------------------------------ menu
+
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.menu_viewer, menu)
+        return true
+    }
+
+    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
+        menu.findItem(R.id.menu_bookmark)?.setIcon(
+            if (file?.let { library.isBookmarked(it.absolutePath, currentIndex) } == true)
+                R.drawable.ic_bookmark else R.drawable.ic_bookmark_border
+        )
+        menu.findItem(R.id.menu_keep_on)?.isChecked = keepOn
+        menu.findItem(R.id.menu_night)?.isChecked = nightFilter
+        menu.findItem(R.id.menu_fullscreen)?.isChecked = prefs.fullscreen
+        menu.findItem(R.id.menu_two_page)?.apply {
+            isChecked = twoPage
+            isEnabled = mode == MODE_PAGED
+        }
+        // Items in a single-choice group must only ever be set to checked: calling
+        // setChecked(false) on one of them re-checks it, which left the last item of
+        // every group showing as selected no matter what was active.
+        checkOnly(menu, if (readingDir == "rtl") R.id.menu_dir_rtl else R.id.menu_dir_ltr)
+        checkOnly(
+            menu,
+            when (mode) {
+                MODE_VERTICAL -> R.id.menu_mode_vertical
+                MODE_LONGSTRIP -> R.id.menu_mode_longstrip
+                else -> R.id.menu_mode_paged
+            }
+        )
+        checkOnly(
+            menu,
+            when (effectiveFit()) {
+                ZoomImageView.FitMode.WIDTH -> R.id.menu_fit_width
+                ZoomImageView.FitMode.HEIGHT -> R.id.menu_fit_height
+                ZoomImageView.FitMode.STRETCH -> R.id.menu_fit_stretch
+                else -> R.id.menu_fit_screen
+            }
+        )
+        checkOnly(
+            menu,
+            when (filter) {
+                Filters.INVERT -> R.id.menu_filter_invert
+                Filters.GRAYSCALE -> R.id.menu_filter_grayscale
+                Filters.CONTRAST -> R.id.menu_filter_contrast
+                Filters.SEPIA -> R.id.menu_filter_sepia
+                else -> R.id.menu_filter_none
+            }
+        )
+        checkOnly(
+            menu,
+            when (requestedOrientation) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT -> R.id.menu_orient_portrait
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE -> R.id.menu_orient_landscape
+                else -> R.id.menu_orient_default
+            }
+        )
+        menu.findItem(R.id.menu_auto_scroll)?.isChecked = autoScrolling
+        menu.findItem(R.id.menu_auto_next)?.isChecked = prefs.autoNext
+        menu.findItem(R.id.menu_auto_crop)?.apply {
+            isChecked = autoCrop
+            isEnabled = mode != MODE_LONGSTRIP
+        }
+        menu.findItem(R.id.menu_series)?.apply {
+            isVisible = prefs.perSeries
+            isChecked = seriesActive
+        }
+        menu.findItem(R.id.menu_chapters)?.isEnabled = chapters.size > 1
+        menu.findItem(R.id.menu_prev_chapter)?.isEnabled = prevChapter() != null
+        menu.findItem(R.id.menu_next_chapter)?.isEnabled = nextChapter() != null
+        return super.onPrepareOptionsMenu(menu)
+    }
+
+    private fun checkOnly(menu: Menu, id: Int) {
+        menu.findItem(id)?.isChecked = true
+    }
+
+    /**
+     * Menu items whose entire action is "assign a reader preference". They live in a
+     * lookup instead of being spelled out in [onOptionsItemSelected], which keeps that
+     * `when` comfortably under the branch limit enforced by static analysis.
+     */
+    private val valueMenus: Map<Int, () -> Unit> by lazy {
+        mapOf(
+            R.id.menu_fit_screen to { setFit("screen") },
+            R.id.menu_fit_width to { setFit("width") },
+            R.id.menu_fit_height to { setFit("height") },
+            R.id.menu_fit_stretch to { setFit("stretch") },
+            R.id.menu_filter_none to { setFilter(Filters.NONE) },
+            R.id.menu_filter_invert to { setFilter(Filters.INVERT) },
+            R.id.menu_filter_grayscale to { setFilter(Filters.GRAYSCALE) },
+            R.id.menu_filter_contrast to { setFilter(Filters.CONTRAST) },
+            R.id.menu_filter_sepia to { setFilter(Filters.SEPIA) },
+            R.id.menu_mode_paged to { setPageMode(MODE_PAGED) },
+            R.id.menu_mode_vertical to { setPageMode(MODE_VERTICAL) },
+            R.id.menu_mode_longstrip to { setPageMode(MODE_LONGSTRIP) },
+            R.id.menu_dir_ltr to { setReadingDir("ltr") },
+            R.id.menu_dir_rtl to { setReadingDir("rtl") },
+            R.id.menu_orient_default to { setOrientationLock(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) },
+            R.id.menu_orient_portrait to { setOrientationLock(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT) },
+            R.id.menu_orient_landscape to { setOrientationLock(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE) }
+        )
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        val id = item.itemId
+        val assign = valueMenus[id]
+        if (assign != null) {
+            assign()
+            return true
+        }
+        return when (id) {
+            R.id.menu_tune -> { showReaderSheet(); true }
+            R.id.menu_chapters -> { showChapterList(); true }
+            R.id.menu_auto_scroll -> { toggleAutoScroll(); true }
+            R.id.menu_auto_next -> { setAutoNext(!prefs.autoNext); true }
+            R.id.menu_auto_speed -> { showAutoSpeedDialog(); true }
+            R.id.menu_auto_crop -> { toggleAutoCrop(); true }
+            R.id.menu_series -> { toggleSeries(); true }
+            R.id.menu_share_page -> { exportPage(share = true); true }
+            R.id.menu_save_page -> { exportPage(share = false); true }
+            R.id.menu_jump -> { showJumpDialog(); true }
+            R.id.menu_rotate -> { cycleOrientation(); true }
+            R.id.menu_bookmark -> { toggleBookmark(); true }
+            R.id.menu_bookmark_list -> { showBookmarks(); true }
+            R.id.menu_pages -> { openPages(); true }
+            R.id.menu_crop -> { startCrop(); true }
+            R.id.menu_two_page -> { toggleTwoPage(); true }
+            R.id.menu_brightness -> { showBrightnessDialog(); true }
+            R.id.menu_page_spacing -> { showSpacingDialog(); true }
+            R.id.menu_prev_chapter -> { openPrevChapter(); true }
+            R.id.menu_next_chapter -> { openNextChapter(); true }
+            R.id.menu_keep_on -> { toggleKeepOn(); true }
+            R.id.menu_night -> { toggleNight(); true }
+            R.id.menu_fullscreen -> { setFullscreen(!prefs.fullscreen); true }
+            else -> super.onOptionsItemSelected(item)
+        }
+    }
+
+    // ------------------------------------------------------------------ reader options
+
+    private fun setFit(name: String) {
+        fit = name
+        persistLayout()
+        adapter?.fitMode = effectiveFit()
+        invalidateOptionsMenu()
+    }
+
+    private fun setFilter(name: String) {
+        filter = name
+        prefs.filter = name
+        adapter?.filter = name
+        invalidateOptionsMenu()
+    }
+
+    private fun setReadingDir(dir: String) {
+        if (readingDir == dir) return
+        readingDir = dir
+        persistLayout()
+        attach()
+    }
+
+    private fun setPageMode(newMode: String) {
+        if (newMode == mode) return
+        stopAutoScroll()
+        mode = newMode
+        // Only the strip modes lay the next chapter in behind this one.
+        if (mode == MODE_PAGED) dropStripAhead()
+        persistLayout()
+        attach()
+        prepareStripAhead()
+    }
+
+    private fun setSpacingDp(dp: Int) {
+        spacingDp = dp.coerceIn(0, 48)
+        prefs.pageSpacing = spacingDp
+        adapter?.spacingPx = spacingPx()
+    }
+
+    private fun toggleTwoPage() {
+        if (mode != MODE_PAGED) {
+            toast(R.string.menu_spread)
+            return
+        }
+        twoPage = !twoPage
+        persistLayout()
+        attach()
+    }
+
+    private fun setOrientationLock(value: Int) {
+        requestedOrientation = value
+        invalidateOptionsMenu()
+    }
+
+    private fun cycleOrientation() {
+        val landscape = resources.configuration.orientation ==
+            android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        setOrientationLock(
+            if (landscape) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        )
+    }
+
+    // ------------------------------------------------------------------ reader bottom sheet
+
+    /** Re-reads the reader state into the open bottom sheet; null while no sheet is shown. */
+    private var sheetSync: (() -> Unit)? = null
+
+    /** True while the sheet's controls are being set from the state rather than by the user. */
+    private var sheetSyncing = false
+
+    private var chopDetector: ChopDetector? = null
+
+    /**
+     * Every state change calls invalidateOptionsMenu(), which refreshes the 3-dots menu. The
+     * open bottom sheet is refreshed from the same place, so a control whose value or
+     * availability depends on another one (two-page needs paged mode, auto-crop is off in
+     * long strip, auto-scroll stops at the end of a chapter) never shows stale state.
+     */
+    override fun invalidateOptionsMenu() {
+        super.invalidateOptionsMenu()
+        sheetSync?.invoke()
+    }
+
+    private fun showReaderSheet() {
+        val view = layoutInflater.inflate(R.layout.sheet_reader, null)
+        val dialog = BottomSheetDialog(this)
+        dialog.setContentView(view)
+        dialog.behavior.skipCollapsed = true
+        dialog.behavior.state = BottomSheetBehavior.STATE_EXPANDED
+
+        val syncers = ArrayList<() -> Unit>()
+
+        bindModeSection(view, syncers)
+        bindFitSection(view, syncers)
+        bindFilterSection(view, syncers)
+        bindDirectionSection(view, syncers)
+        bindBrightnessSection(view)
+        bindSpacingSection(view)
+        bindAutoScrollSection(view, dialog, syncers)
+        bindOrientationSection(view, syncers)
+        bindSwitchSection(view, syncers)
+        bindActionSection(view, dialog, syncers)
+
+        view.findViewById<View>(R.id.sheet_more_settings).setOnClickListener {
+            dialog.dismiss()
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        sheetSync = {
+            sheetSyncing = true
+            try {
+                syncers.forEach { it() }
+            } finally {
+                sheetSyncing = false
+            }
+        }
+        sheetSync?.invoke()
+        dialog.setOnDismissListener { sheetSync = null }
+        dialog.show()
+    }
+
+    private fun bindModeSection(view: View, syncers: MutableList<() -> Unit>) {
+        val group = view.findViewById<MaterialButtonToggleGroup>(R.id.sheet_page_mode)
+        syncers += {
+            group.check(
+                when (mode) {
+                    MODE_VERTICAL -> R.id.btn_mode_vertical
+                    MODE_LONGSTRIP -> R.id.btn_mode_longstrip
+                    else -> R.id.btn_mode_paged
+                }
+            )
+        }
+        group.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked || sheetSyncing) return@addOnButtonCheckedListener
+            when (checkedId) {
+                R.id.btn_mode_vertical -> setPageMode(MODE_VERTICAL)
+                R.id.btn_mode_longstrip -> setPageMode(MODE_LONGSTRIP)
+                R.id.btn_mode_paged -> setPageMode(MODE_PAGED)
+            }
+        }
+    }
+
+    private fun bindFitSection(view: View, syncers: MutableList<() -> Unit>) {
+        val group = view.findViewById<ChipGroup>(R.id.sheet_fit)
+        syncers += {
+            group.check(
+                when (effectiveFit()) {
+                    ZoomImageView.FitMode.WIDTH -> R.id.chip_fit_width
+                    ZoomImageView.FitMode.HEIGHT -> R.id.chip_fit_height
+                    ZoomImageView.FitMode.STRETCH -> R.id.chip_fit_stretch
+                    else -> R.id.chip_fit_screen
+                }
+            )
+            // A continuous strip is always as wide as the screen, so fit has no meaning there.
+            for (i in 0 until group.childCount) group.getChildAt(i).isEnabled = mode != MODE_LONGSTRIP
+        }
+        group.setOnCheckedStateChangeListener { _, checked ->
+            if (sheetSyncing) return@setOnCheckedStateChangeListener
+            when (checked.firstOrNull()) {
+                R.id.chip_fit_width -> setFit("width")
+                R.id.chip_fit_height -> setFit("height")
+                R.id.chip_fit_stretch -> setFit("stretch")
+                R.id.chip_fit_screen -> setFit("screen")
+            }
+        }
+    }
+
+    private fun bindFilterSection(view: View, syncers: MutableList<() -> Unit>) {
+        val group = view.findViewById<ChipGroup>(R.id.sheet_filter)
+        syncers += {
+            group.check(
+                when (filter) {
+                    Filters.INVERT -> R.id.chip_filter_invert
+                    Filters.GRAYSCALE -> R.id.chip_filter_grayscale
+                    Filters.CONTRAST -> R.id.chip_filter_contrast
+                    Filters.SEPIA -> R.id.chip_filter_sepia
+                    else -> R.id.chip_filter_none
+                }
+            )
+        }
+        group.setOnCheckedStateChangeListener { _, checked ->
+            if (sheetSyncing) return@setOnCheckedStateChangeListener
+            when (checked.firstOrNull()) {
+                R.id.chip_filter_invert -> setFilter(Filters.INVERT)
+                R.id.chip_filter_grayscale -> setFilter(Filters.GRAYSCALE)
+                R.id.chip_filter_contrast -> setFilter(Filters.CONTRAST)
+                R.id.chip_filter_sepia -> setFilter(Filters.SEPIA)
+                R.id.chip_filter_none -> setFilter(Filters.NONE)
+            }
+        }
+    }
+
+    private fun bindDirectionSection(view: View, syncers: MutableList<() -> Unit>) {
+        val group = view.findViewById<ChipGroup>(R.id.sheet_dir)
+        syncers += { group.check(if (readingDir == "rtl") R.id.chip_dir_rtl else R.id.chip_dir_ltr) }
+        group.setOnCheckedStateChangeListener { _, checked ->
+            if (sheetSyncing) return@setOnCheckedStateChangeListener
+            when (checked.firstOrNull()) {
+                R.id.chip_dir_rtl -> setReadingDir("rtl")
+                R.id.chip_dir_ltr -> setReadingDir("ltr")
+            }
+        }
+    }
+
+    private fun bindBrightnessSection(view: View) {
+        val label = view.findViewById<TextView>(R.id.sheet_brightness_value)
+        val slider = view.findViewById<Slider>(R.id.sheet_brightness)
+        label.text = brightnessLabel()
+        slider.safeSet(brightness.toFloat())
+        slider.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            setBrightness(value.toInt())
+            label.text = brightnessLabel()
+        }
+    }
+
+    private fun brightnessLabel(): String =
+        getString(R.string.menu_brightness) + " · " + getString(R.string.percent_format, brightness)
+
+    private fun bindSpacingSection(view: View) {
+        val label = view.findViewById<TextView>(R.id.sheet_spacing_value)
+        val slider = view.findViewById<Slider>(R.id.sheet_spacing)
+        label.text = spacingLabel()
+        slider.safeSet(spacingDp.toFloat())
+        slider.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            setSpacingDp(value.toInt())
+            label.text = spacingLabel()
+        }
+    }
+
+    private fun spacingLabel(): String =
+        getString(R.string.menu_page_spacing) + " · $spacingDp dp"
+
+    private fun bindAutoScrollSection(view: View, dialog: BottomSheetDialog, syncers: MutableList<() -> Unit>) {
+        val toggle = view.findViewById<MaterialSwitch>(R.id.sheet_auto_scroll)
+        val label = view.findViewById<TextView>(R.id.sheet_auto_speed_value)
+        val slider = view.findViewById<Slider>(R.id.sheet_auto_speed)
+
+        syncers += {
+            toggle.isChecked = autoScrolling
+            toggle.isEnabled = source != null
+            label.text = getString(R.string.auto_speed_value, prefs.autoSpeed)
+            slider.safeSet(prefs.autoSpeed.toFloat())
+        }
+        toggle.setOnCheckedChangeListener { _, checked ->
+            // A change made by sync equals the current state, so only a real toggle gets through.
+            if (checked == autoScrolling) return@setOnCheckedChangeListener
+            toggleAutoScroll()
+            // Reading starts behind the sheet, so get it out of the way.
+            if (autoScrolling) dialog.dismiss()
+        }
+        slider.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser || sheetSyncing) return@addOnChangeListener
+            prefs.autoSpeed = value.toInt()
+            label.text = getString(R.string.auto_speed_value, prefs.autoSpeed)
+        }
+    }
+
+    private fun bindSwitchSection(view: View, syncers: MutableList<() -> Unit>) {
+        /** Wires a switch whose user taps run [onToggle] only when they change [current]. */
+        fun bind(id: Int, current: () -> Boolean, enabled: () -> Boolean, onToggle: (Boolean) -> Unit) {
+            val sw = view.findViewById<MaterialSwitch>(id)
+            syncers += {
+                sw.isChecked = current()
+                sw.isEnabled = enabled()
+            }
+            sw.setOnCheckedChangeListener { _, checked ->
+                if (sheetSyncing || checked == current()) return@setOnCheckedChangeListener
+                onToggle(checked)
+                // Some toggles refuse or only touch preferences: show what really happened.
+                sheetSync?.invoke()
+            }
+        }
+
+        bind(R.id.sheet_two_page, { twoPage }, { mode == MODE_PAGED }) { toggleTwoPage() }
+        bind(R.id.sheet_auto_crop, { autoCrop }, { mode != MODE_LONGSTRIP }) { toggleAutoCrop() }
+        bind(
+            R.id.sheet_series,
+            { seriesActive },
+            { prefs.perSeries && file?.parentFile != null }
+        ) { toggleSeries() }
+        bind(R.id.sheet_night, { nightFilter }, { true }) { setNight(it) }
+        bind(R.id.sheet_keep_on, { keepOn }, { true }) { setKeepOn(it) }
+        bind(R.id.sheet_fullscreen, { prefs.fullscreen }, { true }) { setFullscreen(it) }
+        bind(R.id.sheet_auto_next, { prefs.autoNext }, { true }) { setAutoNext(it) }
+        bind(R.id.sheet_tap_zones, { prefs.tapZones }, { true }) { prefs.tapZones = it }
+        bind(R.id.sheet_volume_keys, { prefs.volumeKeys }, { true }) { prefs.volumeKeys = it }
+        bind(R.id.sheet_chop_exit, { prefs.chopExit }, { true }) {
+            prefs.chopExit = it
+            updateChopDetector()
+        }
+        val chopLabel = view.findViewById<TextView>(R.id.sheet_chop_sensitivity_value)
+        val chopSlider = view.findViewById<Slider>(R.id.sheet_chop_sensitivity)
+        syncers += {
+            chopLabel.text = getString(R.string.pref_chop_sensitivity) + " · " +
+                getString(R.string.auto_speed_short, prefs.chopSensitivity)
+            chopSlider.safeSet(prefs.chopSensitivity.toFloat())
+            chopSlider.isEnabled = prefs.chopExit
+        }
+        chopSlider.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            prefs.chopSensitivity = value.toInt()
+            chopLabel.text = getString(R.string.pref_chop_sensitivity) + " · " +
+                getString(R.string.auto_speed_short, prefs.chopSensitivity)
+        }
+        bind(R.id.sheet_double_tap, { prefs.doubleTapZoom }, { true }) {
+            prefs.doubleTapZoom = it
+            // The zoom gesture is wired into each page view when the adapter is created.
+            attach()
+        }
+    }
+
+    private fun bindActionSection(view: View, dialog: BottomSheetDialog, syncers: MutableList<() -> Unit>) {
+        val chapterButton = view.findViewById<View>(R.id.sheet_chapters)
+        val shareButton = view.findViewById<View>(R.id.sheet_share)
+        val saveButton = view.findViewById<View>(R.id.sheet_save)
+        syncers += {
+            chapterButton.isEnabled = chapters.size > 1
+            shareButton.isEnabled = source != null
+            saveButton.isEnabled = source != null
+        }
+        chapterButton.setOnClickListener { dialog.dismiss(); showChapterList() }
+        shareButton.setOnClickListener { dialog.dismiss(); exportPage(share = true) }
+        saveButton.setOnClickListener { dialog.dismiss(); exportPage(share = false) }
+    }
+
+    private fun bindOrientationSection(view: View, syncers: MutableList<() -> Unit>) {
+        val group = view.findViewById<ChipGroup>(R.id.sheet_orientation)
+        syncers += {
+            group.check(
+                when (requestedOrientation) {
+                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT -> R.id.chip_orient_portrait
+                    ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE -> R.id.chip_orient_landscape
+                    else -> R.id.chip_orient_default
+                }
+            )
+        }
+        group.setOnCheckedStateChangeListener { _, checked ->
+            if (sheetSyncing) return@setOnCheckedStateChangeListener
+            when (checked.firstOrNull()) {
+                R.id.chip_orient_portrait ->
+                    setOrientationLock(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+                R.id.chip_orient_landscape ->
+                    setOrientationLock(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+                R.id.chip_orient_default ->
+                    setOrientationLock(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+            }
+        }
+    }
+
+    /** Snaps a value onto the slider's step grid before assigning it. */
+    private fun Slider.safeSet(value: Float) {
+        val step = stepSize
+        val snapped = if (step > 0f) valueFrom + Math.round((value - valueFrom) / step) * step else value
+        this.value = snapped.coerceIn(valueFrom, valueTo)
+    }
+
+    private fun showBrightnessDialog() {
+        val slider = Slider(this).apply {
+            valueFrom = 20f
+            valueTo = 100f
+            stepSize = 5f
+            value = (brightness / 5 * 5).toFloat().coerceIn(20f, 100f)
+        }
+        slider.addOnChangeListener { _, value, _ -> setBrightness(value.toInt()) }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.menu_brightness)
+            .setView(sliderContainer(slider))
+            .setPositiveButton(R.string.ok, null)
+            .show()
+    }
+
+    private fun showSpacingDialog() {
+        val slider = Slider(this).apply {
+            valueFrom = 0f
+            valueTo = 48f
+            stepSize = 4f
+            value = (spacingDp / 4 * 4).toFloat().coerceIn(0f, 48f)
+        }
+        slider.addOnChangeListener { _, value, _ -> setSpacingDp(value.toInt()) }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.menu_page_spacing)
+            .setView(sliderContainer(slider))
+            .setPositiveButton(R.string.ok, null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------ auto-scroll
+
+    private fun toggleAutoScroll() {
+        setAutoScroll(!autoScrolling)
+    }
+
+    /** One place that turns auto-scroll on or off, so the sheet and the menu agree. */
+    private fun setAutoScroll(enabled: Boolean) {
+        if (enabled) startAutoScroll() else stopAutoScroll()
+    }
+
+    private fun startAutoScroll() {
+        if (source == null || autoScrolling) return
+        autoScrolling = true
+        autoRemainder = 0f
+        autoLastFrame = SystemClock.uptimeMillis()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (barsVisible) toggleBars()
+        handler.post(autoTick)
+        invalidateOptionsMenu()
+    }
+
+    private fun stopAutoScroll() {
+        if (!autoScrolling) return
+        autoScrolling = false
+        handler.removeCallbacks(autoTick)
+        applyKeepScreenOn()
+        invalidateOptionsMenu()
+    }
+
+    private val autoTick = object : Runnable {
+        override fun run() {
+            if (!autoScrolling) return
+            if (mode == MODE_PAGED) {
+                val count = source?.pageCount ?: return
+                val step = if (useSpread()) 2 else 1
+                if (currentIndex + step >= count) {
+                    finishAutoScroll()
+                    return
+                }
+                goTo(currentIndex + step)
+                handler.postDelayed(this, PAGE_INTERVAL_MS_BASE / prefs.autoSpeed)
+            } else {
+                val now = SystemClock.uptimeMillis()
+                val dt = (now - autoLastFrame).coerceAtMost(100L)
+                autoLastFrame = now
+                autoRemainder += prefs.autoSpeed * DP_PER_SECOND_PER_STEP *
+                    resources.displayMetrics.density * dt / 1000f
+                val px = autoRemainder.toInt()
+                autoRemainder -= px
+                if (px > 0) vertical.scrollBy(0, px)
+                if (!vertical.canScrollVertically(1)) {
+                    finishAutoScroll()
+                    return
+                }
+                handler.postDelayed(this, FRAME_MS)
+            }
+        }
+    }
+
+    /**
+     * Ends an auto-scroll run at the end of a chapter: with "auto next chapter" on
+     * the reading keeps going in the next one ([setup] restarts it there), otherwise
+     * it simply stops.
+     */
+    private fun finishAutoScroll() {
+        val next = nextChapter()
+        if (prefs.autoNext && next != null) {
+            keepAutoScroll = true
+            openChapter(next, 0)
+        } else {
+            stopAutoScroll()
+        }
+    }
+
+    private fun showAutoSpeedDialog() {
+        val slider = Slider(this).apply {
+            valueFrom = 1f
+            valueTo = 10f
+            stepSize = 1f
+            value = prefs.autoSpeed.toFloat()
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle(getString(R.string.auto_speed_value, prefs.autoSpeed))
+            .setPositiveButton(R.string.ok, null)
+        val dialog = builder.create()
+        slider.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            prefs.autoSpeed = value.toInt()
+            dialog.setTitle(getString(R.string.auto_speed_value, prefs.autoSpeed))
+        }
+        dialog.setView(sliderContainer(slider))
+        dialog.show()
+    }
+
+    private fun sliderContainer(slider: Slider): LinearLayout = LinearLayout(this).apply {
+        setPadding(48, 24, 48, 0)
+        addView(
+            slider,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+    }
+
+    private fun toggleAutoCrop() = setAutoCrop(!autoCrop)
+
+    private fun setAutoCrop(enabled: Boolean) {
+        if (autoCrop == enabled) return
+        autoCrop = enabled
+        prefs.autoCrop = autoCrop
+        invalidateOptionsMenu()
+        attach()
+    }
+
+    /**
+     * When on, reaching the end of a chapter opens the next one directly instead of
+     * offering the end-of-chapter prompt. In the strip modes the next chapter is
+     * also opened right away and laid in behind this one, so reading never stops at
+     * the boundary in the first place.
+     */
+    private fun setAutoNext(enabled: Boolean) {
+        if (prefs.autoNext == enabled) return
+        prefs.autoNext = enabled
+        if (enabled) prepareStripAhead() else dropStripAhead()
+        invalidateOptionsMenu()
+        updateEndCard()
+    }
+
+    /** True while the reader should skip the end card and roll into the next chapter. */
+    private fun autoAdvance() = prefs.autoNext && nextChapter() != null
+
+    /**
+     * Watches for a swipe aimed past the end of the chapter. Paged reading clamps
+     * at the last page, so without this the "auto next chapter" setting would have
+     * nothing to act on; swiping there now just rolls into the next chapter. Strips
+     * read downward, so their version of the gesture is a flick upward — and it only
+     * has to catch the gap before the next chapter's pages have been laid in.
+     */
+    private val overSwipeListener = object : RecyclerView.OnItemTouchListener {
+        private var startX = 0f
+        private var startY = 0f
+        private var tracking = false
+
+        override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = e.x
+                    startY = e.y
+                    tracking = true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val dx = e.x - startX
+                    val dy = e.y - startY
+                    val strip = mode != MODE_PAGED
+                    // "Forward" is leftward in a paged book (rightward in RTL) and
+                    // downward in the finger, i.e. a flick up, for a strip.
+                    val along = if (strip) -dy else if (readingDir == "rtl") dx else -dx
+                    val across = if (strip) abs(dx) else abs(dy)
+                    if (tracking && along > across * 2 && along > swipeMinPx() &&
+                        autoAdvance() && atChapterEnd()
+                    ) {
+                        openNextChapter()
+                    }
+                    tracking = false
+                }
+            }
+            // Observing only: never intercept, or the page itself could not be paged.
+            return false
+        }
+
+        override fun onTouchEvent(rv: RecyclerView, e: MotionEvent) = Unit
+
+        override fun onRequestDisallowInterceptTouchEvent(disallow: Boolean) = Unit
+    }
+
+    /** True when the reader sits on the last page or at the bottom of a strip. */
+    private fun atChapterEnd(): Boolean {
+        val src = source ?: return false
+        return when (mode) {
+            MODE_PAGED -> currentIndex >=
+                (if (useSpread()) src.pageCount - 2 else src.pageCount - 1).coerceAtLeast(0)
+            else -> !vertical.canScrollVertically(1)
+        }
+    }
+
+    private fun swipeMinPx(): Int = (resources.displayMetrics.widthPixels / 8f).toInt()
+
+    // ------------------------------------------------------------------ chapter list
+
+    private fun showChapterList() {
+        val list = chapters
+        if (list.size < 2) return
+        val read = library.readSet()
+        val current = siblingIndex()
+        val labels = list.mapIndexed { i, f ->
+            val mark = when {
+                i == current -> "▶ "
+                f.absolutePath in read -> "✓ "
+                else -> "     "
+            }
+            mark + chapterLabel(f)
+        }.toTypedArray()
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.chapters_title)
+            .setItems(labels) { _, which -> if (which != current) openChapter(list[which], 0) }
+            .setNegativeButton(R.string.close, null)
+            .create()
+        dialog.show()
+        if (current > 2) dialog.listView.setSelection(current - 2)
+    }
+
+    // ------------------------------------------------------------------ share / save page
+
+    private fun fileSafeName(): String {
+        val base = file?.let { chapterLabel(it) } ?: "page"
+        return base.replace(Regex("[^A-Za-z0-9._-]"), "_").take(60) + "_p" + (currentIndex + 1)
+    }
+
+    /** Renders the current page at full resolution and either shares or saves it. */
+    private fun exportPage(share: Boolean) {
+        val src = source ?: return
+        val page = currentIndex
+        val name = fileSafeName()
+        progress.visibility = View.VISIBLE
+        lifecycleScope.launch {
+            val outcome: Result<android.net.Uri?> = try {
+                withContext(AppDispatchers.io) {
+                    val bitmap = src.loadPage(page, EXPORT_W, EXPORT_H)
+                    try {
+                        if (share) shareUri(bitmap, name) else {
+                            savePicture(bitmap, name)
+                            null
+                        }
+                    } finally {
+                        if (!bitmap.isRecycled) bitmap.recycle()
+                    }
+                }.let { Result.success<android.net.Uri?>(it) }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                Result.failure<android.net.Uri?>(e)
+            }
+            progress.visibility = View.GONE
+            val uri = outcome.getOrNull()
+            when {
+                outcome.isFailure -> toast(R.string.error_load)
+                share && uri != null -> startActivity(
+                    Intent.createChooser(
+                        Intent(Intent.ACTION_SEND)
+                            .setType("image/png")
+                            .putExtra(Intent.EXTRA_STREAM, uri)
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                        getString(R.string.menu_share_page)
+                    )
+                )
+                else -> toast(R.string.page_saved)
+            }
+        }
+    }
+
+    /** Writes [bitmap] under cache/shared (exposed through the FileProvider) and returns its URI. */
+    private fun shareUri(bitmap: Bitmap, name: String): android.net.Uri {
+        val dir = File(cacheDir, SHARE_DIR)
+        dir.mkdirs()
+        dir.listFiles()?.forEach { runCatching { it.delete() } } // keep only the latest shared page
+        val out = File(dir, "$name.png")
+        out.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        return FileProvider.getUriForFile(this, "$packageName.files", out)
+    }
+
+    private fun savePicture(bitmap: Bitmap, name: String) {
+        val stamp = System.currentTimeMillis()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "${name}_$stamp.png")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ComicReader")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val resolver = contentResolver
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw java.io.IOException("Could not create the picture")
+            try {
+                val output = resolver.openOutputStream(uri)
+                    ?: throw java.io.IOException("Could not open the picture destination")
+                output.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+            } catch (t: Throwable) {
+                resolver.delete(uri, null, null)
+                throw t
+            }
+        } else {
+            val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: File(cacheDir, "pictures")
+            dir.mkdirs()
+            File(dir, "${name}_$stamp.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        }
+    }
+
+    // ------------------------------------------------------------------ bookmarks
+
+    private fun toggleBookmark() {
+        val f = file ?: return
+        val path = f.absolutePath
+        if (library.isBookmarked(path, currentIndex)) {
+            library.removeBookmark(path, currentIndex)
+            toast(R.string.bookmark_removed)
+            invalidateOptionsMenu()
+            return
+        }
+        // Notes are optional, so a quick bookmark remains a two-tap operation.
+        val noteInput = EditText(this).apply {
+            hint = getString(R.string.bookmark_note_hint)
+            maxLines = 3
+            setSingleLine(false)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 8, 48, 0)
+            addView(noteInput, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.bookmark_page_title, currentIndex + 1))
+            .setView(container)
+            .setPositiveButton(R.string.bookmark_save_with_note) { _, _ ->
+                val note = noteInput.text.toString().trim().take(MAX_BOOKMARK_NOTE_LENGTH)
+                library.addBookmark(Bookmark(path, f.name, currentIndex, note, System.currentTimeMillis()))
+                toast(R.string.bookmark_saved)
+                invalidateOptionsMenu()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showBookmarks() {
+        val f = file ?: return
+        val marks = library.bookmarksFor(f.absolutePath)
+        if (marks.isEmpty()) {
+            toast(R.string.no_bookmarks_in_book)
+            return
+        }
+        val count = source?.pageCount ?: 0
+        val labels = marks.map { mark ->
+            val page = getString(R.string.page_indicator, mark.page + 1, count)
+            if (mark.note.isBlank()) page else "$page · ${mark.note}"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.menu_bookmark_list)
+            .setItems(labels) { _, which -> showBookmarkActions(f, marks[which], count) }
+            .setNeutralButton(R.string.clear) { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle(R.string.bookmark_clear_title)
+                    .setMessage(R.string.bookmark_clear_message)
+                    .setNegativeButton(R.string.cancel, null)
+                    .setPositiveButton(R.string.clear) { _, _ ->
+                        marks.forEach { library.removeBookmark(f.absolutePath, it.page) }
+                        invalidateOptionsMenu()
+                    }
+                    .show()
+            }
+            .show()
+    }
+
+    private fun showBookmarkActions(book: File, mark: Bookmark, pageCount: Int) {
+        val options = arrayOf(
+            getString(R.string.bookmark_go_to_page),
+            getString(R.string.bookmark_edit_note),
+            getString(R.string.bookmark_remove)
+        )
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.page_indicator, mark.page + 1, pageCount))
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> goTo(mark.page)
+                    1 -> editBookmarkNote(book, mark)
+                    2 -> {
+                        library.removeBookmark(book.absolutePath, mark.page)
+                        invalidateOptionsMenu()
+                        toast(R.string.bookmark_removed)
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun editBookmarkNote(book: File, mark: Bookmark) {
+        val input = EditText(this).apply {
+            hint = getString(R.string.bookmark_note_hint)
+            setText(mark.note)
+            maxLines = 3
+            setSingleLine(false)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 8, 48, 0)
+            addView(input, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.bookmark_edit_note)
+            .setView(container)
+            .setPositiveButton(R.string.save) { _, _ ->
+                library.addBookmark(mark.copy(note = input.text.toString().trim().take(MAX_BOOKMARK_NOTE_LENGTH), time = System.currentTimeMillis()))
+                toast(R.string.bookmark_saved)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showJumpDialog() {
+        val count = source?.pageCount ?: return
+        val input = EditText(this)
+        input.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        input.hint = getString(R.string.jump_hint)
+        val container = LinearLayout(this).apply {
+            setPadding(48, 24, 48, 0)
+            addView(
+                input,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.menu_jump)
+            .setView(container)
+            .setPositiveButton(R.string.ok) { _, _ ->
+                val n = input.text.toString().toIntOrNull() ?: return@setPositiveButton
+                goTo((n - 1).coerceIn(0, count - 1))
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------ crop / pages
+
+    private fun openPages() {
+        val f = file ?: return
+        pagesLauncher.launch(
+            Intent(this, PagesActivity::class.java)
+                .putExtra(PagesActivity.EXTRA_PATH, f.absolutePath)
+                .putExtra(PagesActivity.EXTRA_PAGE, currentIndex)
+        )
+    }
+
+    private fun startCrop() {
+        val src = source ?: return
+        val page = currentIndex
+        progress.visibility = View.VISIBLE
+        lifecycleScope.launch {
+            val bitmap = withContext(AppDispatchers.io) {
+                try {
+                    src.loadPage(page, 2400, 3200)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            val outFile = if (bitmap == null) null else withContext(AppDispatchers.io) {
+                runCatching {
+                    val out = File(cacheDir, "crop_src.png")
+                    out.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    out
+                }.getOrNull()
+            }
+            progress.visibility = View.GONE
+            if (outFile == null) {
+                toast(R.string.error_load)
+                return@launch
+            }
+            cropSource = outFile
+            cropLauncher.launch(
+                Intent(this@ViewerActivity, CropActivity::class.java)
+                    .putExtra(CropActivity.EXTRA_PATH, outFile.absolutePath)
+            )
+        }
+    }
+
+    private fun toast(res: Int) = Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
+
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+
+    companion object {
+        private const val MAX_BOOKMARK_NOTE_LENGTH = 500
+        const val EXTRA_PATH = "extra_path"
+        const val EXTRA_PAGE = "extra_page"
+
+        private const val SHARE_DIR = "shared"
+        private const val EXPORT_W = 2400
+        private const val EXPORT_H = 3200
+        private const val MAX_SESSION_SECONDS = 4L * 3600
+        private const val PAGE_INTERVAL_MS_BASE = 13_000L
+        private const val DP_PER_SECOND_PER_STEP = 30f
+        private const val FRAME_MS = 16L
+
+        private const val MODE_PAGED = "paged"
+        private const val MODE_VERTICAL = "vertical"
+        private const val MODE_LONGSTRIP = "longstrip"
+    }
+}
