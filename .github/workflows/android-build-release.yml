@@ -51,6 +51,9 @@ jobs:
           keyPassword=android
           PROPS
 
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
       - name: Run unit tests, lint, and build debug/release APKs
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleRelease
 

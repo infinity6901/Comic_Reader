@@ -1169,19 +1169,55 @@ class ListActivity : AppCompatActivity() {
         return true
     }
 
-    /** Opens a random unread comic from the current visible listing. */
+    /**
+     * Picks a comic folder, not an individual chapter. If its latest chapter is
+     * partially read, resume that chapter; otherwise continue with the first
+     * unread chapter after the most recently read one (or the first unread chapter).
+     */
     private fun openRandomUnread() {
-        val candidates = shown.filter { entry ->
-            !entry.isDir && entry.file.isFile && Formats.isOpenable(entry.name) &&
-                !library.isRead(entry.file.absolutePath)
-        }
+        val history = library.historyMap()
+        val read = library.readSet()
+
+        fun chaptersIn(folder: File): List<File> = folder.listFiles()
+            ?.filter { it.isFile && !it.name.startsWith(".") && Formats.isOpenable(it.name) }
+            ?.sortedWith(compareBy(NaturalOrder) { it.name })
+            .orEmpty()
+
+        data class ComicChoice(val folder: File, val chapters: List<File>, val target: File, val page: Int)
+
+        val candidates = shown.asSequence()
+            .filter { it.isDir && it.file.isDirectory }
+            .mapNotNull { entry ->
+                val chapters = chaptersIn(entry.file)
+                if (chapters.isEmpty()) return@mapNotNull null
+                val unread = chapters.filter { it.absolutePath !in read }
+                if (unread.isEmpty()) return@mapNotNull null
+
+                val latestHistory = chapters.mapNotNull { chapter ->
+                    history[chapter.absolutePath]?.let { chapter to it }
+                }.maxByOrNull { it.second.time }
+
+                val targetAndPage = if (latestHistory != null && latestHistory.first.absolutePath !in read) {
+                    // A saved history entry that is not marked complete is an in-progress chapter.
+                    latestHistory.first to -1 // ViewerActivity resolves -1 to saved progress/resume prompt.
+                } else {
+                    val lastRead = latestHistory?.first
+                    val afterLastRead = if (lastRead != null) {
+                        chapters.drop(chapters.indexOf(lastRead) + 1).firstOrNull { it.absolutePath !in read }
+                    } else null
+                    (afterLastRead ?: unread.first()) to 0
+                }
+                ComicChoice(entry.file, chapters, targetAndPage.first, targetAndPage.second)
+            }
+            .toList()
+
         val picked = candidates.randomOrNull()
         if (picked == null) {
             toast(R.string.random_unread_none)
             return
         }
-        Toast.makeText(this, getString(R.string.random_unread_picked, picked.name), Toast.LENGTH_SHORT).show()
-        onEntryClick(picked)
+        Toast.makeText(this, getString(R.string.random_unread_picked, picked.folder.name), Toast.LENGTH_SHORT).show()
+        openViewer(picked.target, picked.page)
     }
 
     private fun showSortDialog() {
